@@ -1,0 +1,321 @@
+diff --git rust/platform/BUILD rust/platform/BUILD
+index bb34d9b..fb6f369 100644
+--- rust/platform/BUILD
++++ rust/platform/BUILD
+@@ -3,3 +3,8 @@ package(default_visibility = ["//visibility:public"])
+ load(":platform.bzl", "declare_config_settings")
+ 
+ declare_config_settings()
++
++constraint_value(
++    name = "none",
++    constraint_setting = "@bazel_tools//platforms:os",
++)
+diff --git rust/platform/triple_mappings.bzl rust/platform/triple_mappings.bzl
+index 2b1b601..e604ebd 100644
+--- rust/platform/triple_mappings.bzl
++++ rust/platform/triple_mappings.bzl
+@@ -17,6 +17,7 @@ _CPU_ARCH_TO_BUILTIN_PLAT_SUFFIX = {
+     "le32": None,
+     "mips": None,
+     "mipsel": None,
++    "thumbv7em": "arm",
+ }
+ 
+ # Systems that map to a "@bazel_tools//platforms entry
+@@ -27,6 +28,7 @@ _SYSTEM_TO_BUILTIN_SYS_SUFFIX = {
+     "windows": "windows",
+     "ios": "ios",
+     "android": "android",
++    "none": "none",
+     "emscripten": None,
+     "nacl": None,
+     "bitrig": None,
+@@ -43,6 +45,7 @@ _SYSTEM_TO_BINARY_EXT = {
+     "darwin": "",
+     "windows": ".exe",
+     "emscripten": ".js",
++    "none": "",
+ }
+ 
+ _SYSTEM_TO_STATICLIB_EXT = {
+@@ -52,6 +55,7 @@ _SYSTEM_TO_STATICLIB_EXT = {
+     # TODO(acmcarther): To be verified
+     "windows": ".lib",
+     "emscripten": ".js",
++    "none": ".a",
+ }
+ 
+ _SYSTEM_TO_DYLIB_EXT = {
+@@ -61,6 +65,9 @@ _SYSTEM_TO_DYLIB_EXT = {
+     # TODO(acmcarther): To be verified
+     "windows": ".dll",
+     "emscripten": ".js",
++    # Does not support dylibs.
++    # (HACK) The .so is only here so we can build procedural macros on unix host platforms.
++    "none": ".so",
+ }
+ 
+ def cpu_arch_to_constraints(cpu_arch):
+@@ -84,6 +91,8 @@ def system_to_constraints(system):
+     if not sys_suffix:
+         fail("System \"{}\" is not supported by rules_rust".format(sys_suffix))
+ 
++    if sys_suffix == "none":
++        return ["@io_bazel_rules_rust//rust/platform:none"]
+     return ["@bazel_tools//platforms:{}".format(sys_suffix)]
+ 
+ def abi_to_constraints(abi):
+@@ -91,12 +100,19 @@ def abi_to_constraints(abi):
+     # figure out how they're doing this
+     return []
+ 
+-def triple_to_system(triple):
++def _triple_to_components(triple):
+     component_parts = triple.split("-")
++
++    # Some of the triples don't specify a CPU vendor type.
++    # Insert "unknown" when the second component already matches an OS name.
++    if len(component_parts) >= 2 and component_parts[1] in _SYSTEM_TO_BUILTIN_SYS_SUFFIX:
++        component_parts = component_parts[:1] + ["unknown"] + component_parts[1:]
+     if len(component_parts) < 3:
+         fail("Expected target triple to contain at least three sections separated by '-'")
++    return component_parts
+ 
+-    return component_parts[2]
++def triple_to_system(triple):
++    return _triple_to_components(triple)[2]
+ 
+ def system_to_dylib_ext(system):
+     return _SYSTEM_TO_DYLIB_EXT[system]
+@@ -108,9 +124,7 @@ def system_to_binary_ext(system):
+     return _SYSTEM_TO_BINARY_EXT[system]
+ 
+ def triple_to_constraint_set(triple):
+-    component_parts = triple.split("-")
+-    if len(component_parts) < 3:
+-        fail("Expected target triple to contain at least three sections separated by '-'")
++    component_parts = _triple_to_components(triple)
+ 
+     cpu_arch = component_parts[0]
+     vendor = component_parts[1]
+diff --git rust/private/rust.bzl rust/private/rust.bzl
+index d14b761..24d7528 100644
+--- rust/private/rust.bzl
++++ rust/private/rust.bzl
+@@ -83,35 +83,35 @@ def _rust_library_impl(ctx):
+     rust_lib = ctx.actions.declare_file(rust_lib_name)
+ 
+     return rustc_compile_action(
+-        ctx = ctx,
+-        toolchain = toolchain,
+         crate_info = CrateInfo(
+             name = ctx.label.name,
+-            type = ctx.attr.crate_type,
+-            root = lib_rs,
+             srcs = ctx.files.srcs,
+-            deps = ctx.attr.deps,
+-            output = rust_lib,
+             edition = _get_edition(ctx, toolchain),
++            output = rust_lib,
++            root = lib_rs,
++            type = ctx.attr.crate_type,
++            deps = ctx.attr.deps,
+         ),
++        ctx = ctx,
+         output_hash = output_hash,
++        toolchain = toolchain,
+     )
+ 
+ def _rust_binary_impl(ctx):
+     toolchain = find_toolchain(ctx)
+ 
+     return rustc_compile_action(
+-        ctx = ctx,
+-        toolchain = toolchain,
+         crate_info = CrateInfo(
+             name = ctx.label.name,
+-            type = "bin",
+-            root = _crate_root_src(ctx, "main.rs"),
+             srcs = ctx.files.srcs,
+-            deps = ctx.attr.deps,
+-            output = ctx.outputs.executable,
+             edition = _get_edition(ctx, toolchain),
++            output = ctx.outputs.executable,
++            root = _crate_root_src(ctx, "main.rs"),
++            type = "bin",
++            deps = ctx.attr.deps,
+         ),
++        ctx = ctx,
++        toolchain = toolchain,
+     )
+ 
+ def _rust_test_common(ctx, test_binary):
+@@ -130,30 +130,30 @@ def _rust_test_common(ctx, test_binary):
+         parent_crate = ctx.attr.deps[0][CrateInfo]
+         target = CrateInfo(
+             name = test_binary.basename,
+-            type = parent_crate.type,
+-            root = parent_crate.root,
+             srcs = parent_crate.srcs,
+-            deps = parent_crate.deps,
+-            output = test_binary,
+             edition = parent_crate.edition,
++            output = test_binary,
++            root = parent_crate.root,
++            type = parent_crate.type,
++            deps = parent_crate.deps,
+         )
+     else:
+         # Target is a standalone crate. Build the test binary as its own crate.
+         target = CrateInfo(
+             name = test_binary.basename,
+-            type = "lib",
+-            root = _crate_root_src(ctx),
+             srcs = ctx.files.srcs,
+-            deps = ctx.attr.deps,
+-            output = test_binary,
+             edition = _get_edition(ctx, toolchain),
++            output = test_binary,
++            root = _crate_root_src(ctx),
++            type = "lib",
++            deps = ctx.attr.deps,
+         )
+ 
+     return rustc_compile_action(
+-        ctx = ctx,
+-        toolchain = toolchain,
+         crate_info = target,
++        ctx = ctx,
+         rust_flags = ["--test"],
++        toolchain = toolchain,
+     )
+ 
+ def _rust_test_impl(ctx):
+@@ -279,15 +279,15 @@ _rust_library_attrs = {
+         """),
+         default = "rlib",
+     ),
++    "proc_macro_dep": attr.bool(
++        default = False,
++    ),
+ }
+ 
+ rust_library = rule(
+     _rust_library_impl,
+     attrs = dict(_rust_common_attrs.items() +
+                  _rust_library_attrs.items()),
+-    fragments = ["cpp"],
+-    host_fragments = ["cpp"],
+-    toolchains = ["@io_bazel_rules_rust//rust:toolchain"],
+     doc = """
+ Builds a Rust library crate.
+ 
+@@ -352,15 +352,14 @@ Target //examples/rust/hello_lib:hello_lib up-to-date:
+ INFO: Elapsed time: 1.245s, Critical Path: 1.01s
+ ```
+ """,
++    fragments = ["cpp"],
++    host_fragments = ["cpp"],
++    toolchains = ["@io_bazel_rules_rust//rust:toolchain"],
+ )
+ 
+ rust_binary = rule(
+     _rust_binary_impl,
+     attrs = _rust_common_attrs,
+-    executable = True,
+-    fragments = ["cpp"],
+-    host_fragments = ["cpp"],
+-    toolchains = ["@io_bazel_rules_rust//rust:toolchain"],
+     doc = """
+ Builds a Rust binary crate.
+ 
+@@ -445,16 +444,15 @@ INFO: Running command line: bazel-bin/examples/rust/hello_world/hello_world
+ Hello world
+ ```
+ """,
++    executable = True,
++    fragments = ["cpp"],
++    host_fragments = ["cpp"],
++    toolchains = ["@io_bazel_rules_rust//rust:toolchain"],
+ )
+ 
+ rust_test = rule(
+     _rust_test_impl,
+     attrs = _rust_common_attrs,
+-    executable = True,
+-    fragments = ["cpp"],
+-    host_fragments = ["cpp"],
+-    test = True,
+-    toolchains = ["@io_bazel_rules_rust//rust:toolchain"],
+     doc = """
+ Builds a Rust test crate.
+ 
+@@ -578,15 +576,16 @@ rust_test(
+ 
+ Run the test with `bazel build //hello_lib:hello_lib_test`.
+ """,
++    executable = True,
++    fragments = ["cpp"],
++    host_fragments = ["cpp"],
++    test = True,
++    toolchains = ["@io_bazel_rules_rust//rust:toolchain"],
+ )
+ 
+ rust_benchmark = rule(
+     _rust_benchmark_impl,
+     attrs = _rust_common_attrs,
+-    executable = True,
+-    fragments = ["cpp"],
+-    host_fragments = ["cpp"],
+-    toolchains = ["@io_bazel_rules_rust//rust:toolchain"],
+     doc = """
+ Builds a Rust benchmark test.
+ 
+@@ -667,4 +666,8 @@ rust_benchmark(
+ 
+ Run the benchmark test using: `bazel run //fibonacci:fibonacci_bench`.
+ """,
++    executable = True,
++    fragments = ["cpp"],
++    host_fragments = ["cpp"],
++    toolchains = ["@io_bazel_rules_rust//rust:toolchain"],
+ )
+diff --git rust/private/rustc.bzl rust/private/rustc.bzl
+index 470a85e..1cae7cd 100644
+--- rust/private/rustc.bzl
++++ rust/private/rustc.bzl
+@@ -124,8 +124,8 @@ def collect_deps(deps, toolchain):
+         direct_crates = depset(direct_crates),
+         transitive_crates = transitive_crates,
+         transitive_dylibs = transitive_dylibs,
+-        transitive_staticlibs = transitive_staticlibs,
+         transitive_libs = transitive_libs.to_list(),
++        transitive_staticlibs = transitive_staticlibs,
+     )
+ 
+ def _get_linker_and_args(ctx, rpaths):
+@@ -184,10 +184,7 @@ def rustc_compile_action(
+ 
+     compile_inputs = depset(
+         crate_info.srcs +
+-        getattr(ctx.files, "data", []) +
+-        dep_info.transitive_libs +
+-        [toolchain.rustc] +
+-        toolchain.crosstool_files,
++        getattr(ctx.files, "data", []) + dep_info.transitive_libs + [toolchain.rustc] + toolchain.crosstool_files,
+         transitive = [
+             toolchain.rustc_lib.files,
+             toolchain.rust_lib.files,
+@@ -211,7 +208,10 @@ def rustc_compile_action(
+ 
+     args.add("--emit=dep-info,link")
+     args.add("--color=always")
+-    args.add("--target=" + toolchain.target_triple)
++    if crate_info.type == "proc-macro" or (hasattr(ctx.attr, "proc_macro_dep") and ctx.attr.proc_macro_dep):
++        pass
++    else:
++        args.add("--target=" + toolchain.target_triple)
+     if hasattr(ctx.attr, "crate_features"):
+         args.add_all(getattr(ctx.attr, "crate_features"), before_each = "--cfg", format_each = 'feature="%s"')
+     args.add_all(rust_flags)
